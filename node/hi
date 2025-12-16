@@ -1,0 +1,183 @@
+const { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, Events } = require("discord.js");
+const fs = require("fs");
+require("dotenv").config();
+
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.DirectMessages,
+  ],
+  partials: ["CHANNEL"]
+});
+
+const STAFF_ROLE = "1443172886016823296";
+const DATA_FILE = "./ids.json";
+
+if (!fs.existsSync(DATA_FILE)) fs.writeFileSync(DATA_FILE, "{}");
+
+const steps = new Map();
+const pendingApprovals = new Map();
+const ids = JSON.parse(fs.readFileSync(DATA_FILE));
+
+const APPROVAL_CHANNEL_ID = "1450606630726013031";
+
+client.once("ready", () => {
+  console.log(`✅ Logged in as ${client.user.tag}`);
+});
+
+client.on("messageCreate", async (message) => {
+  if (message.author.bot) return;
+
+  // === بدء إنشاء الهوية ===
+  if (message.content === "#انشاء_هوية") {
+    steps.set(message.author.id, { step: 1, data: {} });
+    return message.reply("🪪 **اكتب اسمك الكامل:**");
+  }
+
+  const userStep = steps.get(message.author.id);
+  if (userStep) {
+    switch (userStep.step) {
+      case 1:
+        userStep.data.name = message.content;
+        userStep.step++;
+        return message.reply("📅 **اكتب عمرك:**");
+
+      case 2:
+        userStep.data.age = message.content;
+        userStep.step++;
+        return message.reply("💼 **اكتب وظيفتك:**");
+
+      case 3:
+        userStep.data.job = message.content;
+        userStep.step++;
+        return message.reply("🆔 **اكتب رقم الهوية:**");
+
+      case 4:
+        userStep.data.id = message.content;
+        steps.delete(message.author.id);
+
+        // ارسل طلب الموافقة لقناة الإدارة
+        const embed = buildIDEmbed(userStep.data, message.author);
+
+        const row = new ActionRowBuilder().addComponents(
+          new ButtonBuilder()
+            .setCustomId(`approve_${message.author.id}`)
+            .setLabel("✅ قبول")
+            .setStyle(ButtonStyle.Success),
+          new ButtonBuilder()
+            .setCustomId(`reject_${message.author.id}`)
+            .setLabel("❌ رفض")
+            .setStyle(ButtonStyle.Danger)
+        );
+
+        const channel = await client.channels.fetch(APPROVAL_CHANNEL_ID);
+        const approvalMessage = await channel.send({
+          content: `**طلب هوية جديد من:** <@${message.author.id}>`,
+          embeds: [embed],
+          components: [row],
+        });
+
+        pendingApprovals.set(message.author.id, { embed, approvalMessage });
+        return message.reply("⌛ تم إرسال طلب الهوية للإدارة للموافقة.");
+    }
+  }
+
+  // === أمر استرجاع الهوية (للمسؤولين) ===
+  if (message.content.startsWith("#هويت")) {
+    if (!message.member.roles.cache.has(STAFF_ROLE)) {
+      return message.reply("❌ هذا الأمر مخصص للإدارة فقط");
+    }
+
+    const user = message.mentions.users.first();
+    if (!user) return message.reply("❌ منشن الشخص");
+
+    const data = ids[user.id];
+    if (!data) return message.reply("❌ ما عنده هوية");
+
+    const embed = buildIDEmbed(data);
+
+    try {
+      await user.send({
+        content:
+          "# السلام عليكم و رحمة الله و بركاته\n" +
+          "حبيت ابلغ ان هويتك وصلت و الرجاء الاحتفاظ بها\n\n",
+        embeds: [embed],
+      });
+
+      message.reply("✅ تم إرسال الهوية على الخاص");
+    } catch {
+      message.reply("❌ ما قدرت أرسل خاص");
+    }
+  }
+});
+
+client.on(Events.InteractionCreate, async (interaction) => {
+  if (!interaction.isButton()) return;
+
+  const [action, userId] = interaction.customId.split("_");
+
+  if (action !== "approve" && action !== "reject") return;
+
+  if (!interaction.member.roles.cache.has(STAFF_ROLE)) {
+    return interaction.reply({ content: "❌ هذا الأمر مخصص للإدارة فقط", ephemeral: true });
+  }
+
+  const pending = pendingApprovals.get(userId);
+  if (!pending) {
+    return interaction.reply({ content: "❌ لا يوجد طلب معلق لهذا المستخدم.", ephemeral: true });
+  }
+
+  const user = await client.users.fetch(userId);
+
+  if (action === "approve") {
+    // حفظ الهوية
+    ids[userId] = { ...pending.embed.data };
+    fs.writeFileSync(DATA_FILE, JSON.stringify(ids, null, 2));
+
+    try {
+      await user.send({
+        content:
+          "# السلام عليكم و رحمة الله و بركاته\n" +
+          "حبيت ابلغ ان هويتك وصلت و الرجاء الاحتفاظ بها\n\n",
+        embeds: [pending.embed],
+      });
+
+      await interaction.update({ content: `✅ تم قبول الهوية لـ <@${userId}>`, components: [] });
+    } catch {
+      await interaction.update({ content: `❌ ما قدرت أرسل الخاص لـ <@${userId}>`, components: [] });
+    }
+  } else if (action === "reject") {
+    try {
+      await user.send("❌ تم رفض هويتك من قبل الإدارة.");
+      await interaction.update({ content: `❌ تم رفض الهوية لـ <@${userId}>`, components: [] });
+    } catch {
+      await interaction.update({ content: `❌ ما قدرت أرسل الخاص لـ <@${userId}>`, components: [] });
+    }
+  }
+
+  pendingApprovals.delete(userId);
+});
+
+function buildIDEmbed(data, author) {
+  // Embed with data fields
+  // Also save raw data in embed.data for easy access
+  const embed = new EmbedBuilder()
+    .setColor("#c8a165")
+    .setTitle("🪪 البطاقة الوطنية")
+    .addFields(
+      { name: "👤 الاسم", value: data.name, inline: true },
+      { name: "🔢 رقم الهوية", value: data.id, inline: true },
+      { name: "📅 العمر", value: data.age, inline: true },
+      { name: "💼 الوظيفة", value: data.job, inline: true }
+    )
+    .setFooter({ text: "الهوية الوطنية" })
+    .setTimestamp();
+
+  // Save data raw inside embed object (custom property)
+  embed.data = data;
+  return embed;
+}
+
+client.login(M6xFGTgIWzuq3g0TITQ9N21cS5buSrt5);
